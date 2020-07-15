@@ -1,12 +1,17 @@
 #[cfg(test)]
 mod tests {
+    use super::*;
     // TODO: Write tests
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn pipe() {
+        let command = Single::new("echo")
+            .a("foo\nbar\nbaz")
+            .pipe(Single::new("grep").a("bar"));
+        assert_eq!(command.run().unwrap().stdout(), "bar\n");
     }
 }
 
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::{fmt, io, io::Write, process};
 
@@ -36,8 +41,6 @@ impl Output {
         self.stderr.as_ref()
     }
 }
-
-use std::collections::HashMap;
 
 pub trait Command: Sized + std::fmt::Debug + Clone {
     /// Equivalent to &&, as in "command 1" && "command 2".
@@ -73,7 +76,7 @@ pub trait Command: Sized + std::fmt::Debug + Clone {
     }
 
     /// Sets the env in the environment the command is run in.
-    fn with_env(self, key: &str, value: &str) -> Env<Self> {
+    fn env(self, key: &str, value: &str) -> Env<Self> {
         Env {
             key: key.to_owned(),
             value: value.to_owned(),
@@ -82,13 +85,36 @@ pub trait Command: Sized + std::fmt::Debug + Clone {
     }
 
     /// Clears the environment for non-explicitly set variables.
-    fn clear_env(self) -> ClearEnv<Self> {
+    fn clear_envs(self) -> ClearEnv<Self> {
         ClearEnv { on: self }
+    }
+
+    /// Removes a variable from the enviroment in which the command is run.
+    fn without_env(self, key: &str) -> ExceptEnv<Self> {
+        ExceptEnv {
+            key: key.to_owned(),
+            on: self,
+        }
+    }
+
+    /// Takes an iterable of Strings for keys to remove.
+    fn without_envs<I: IntoIterator<Item = String>>(self, envs: I) -> ExceptEnvs<Self, I> {
+        ExceptEnvs {
+            on: self,
+            keys: envs,
+        }
+    }
+
+    fn with_dir<P: AsRef<std::path::Path>>(self, dir: P) -> Dir<Self> {
+        Dir {
+            on: self,
+            path: dir.as_ref().to_owned(),
+        }
     }
 
     /// Runs the command.
     fn run(&self) -> io::Result<Output> {
-        self.run_internal(None, false, HashMap::new())
+        self.run_internal(None, false, HashMap::new(), HashSet::new(), None)
     }
 
     /// Pipes `input` into the following command.
@@ -100,12 +126,58 @@ pub trait Command: Sized + std::fmt::Debug + Clone {
     }
 
     /// The command used to define all others.
+    /// input: the string to be piped into the next command run.
+    /// clear_env: if the global enviromental variables should be cleared.
+    /// env: what enviromental variables to set, supercedes clear_env.
     fn run_internal(
         &self,
         input: Option<&str>,
         clear_env: bool,
         env: HashMap<String, String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> io::Result<Output>;
+}
+
+/// Sets the directory of the command.
+#[derive(Clone)]
+pub struct Dir<C>
+where
+    C: Command,
+{
+    on: C,
+    path: std::path::PathBuf,
+}
+
+impl<C: Command> fmt::Debug for Dir<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(f, "cd {:?}; {:?}", self.path, self.on)
+    }
+}
+
+impl<C: Command> Command for Dir<C> {
+    fn run_internal(
+        &self,
+        input: std::option::Option<&str>,
+        clear_env: bool,
+        envs: std::collections::HashMap<std::string::String, std::string::String>,
+        del_envs: std::collections::HashSet<std::string::String>,
+        _: Option<std::path::PathBuf>,
+    ) -> std::result::Result<Output, std::io::Error> {
+        self.on
+            .run_internal(input, clear_env, envs, del_envs, Some(self.path.clone()))
+    }
+}
+
+/// Removes multable keys from the enviroment.
+#[derive(Clone)]
+pub struct ExceptEnvs<C, I>
+where
+    C: Command,
+    I: IntoIterator<Item = String>,
+{
+    on: C,
+    keys: I,
 }
 
 /// Contains input to be piped into a command.
@@ -130,12 +202,15 @@ impl<F: Command> Command for Input<F> {
         input: std::option::Option<&str>,
         clear_env: bool,
         env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
         let input_string = match input.as_ref() {
             Some(prev) => prev.to_string() + &self.input,
             None => self.input.to_owned(),
         };
-        self.on.run_internal(Some(&input_string), clear_env, env)
+        self.on
+            .run_internal(Some(&input_string), clear_env, env, del_env, path)
     }
 }
 impl<F: Command> fmt::Debug for ClearEnv<F> {
@@ -149,8 +224,10 @@ impl<F: Command> Command for ClearEnv<F> {
         input: std::option::Option<&str>,
         _: bool,
         env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
-        self.on.run_internal(input, true, env)
+        self.on.run_internal(input, true, env, del_env, path)
     }
 }
 
@@ -161,6 +238,34 @@ where
     F: Command,
 {
     on: F,
+}
+
+/// Unsets a key from the enviroment.
+#[derive(Clone)]
+pub struct ExceptEnv<F>
+where
+    F: Command,
+{
+    key: String,
+    on: F,
+}
+impl<F: Command> fmt::Debug for ExceptEnv<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(f, "unset {} {:?}", self.key, self.on)
+    }
+}
+impl<F: Command> Command for ExceptEnv<F> {
+    fn run_internal(
+        &self,
+        input: Option<&str>,
+        clear_env: bool,
+        env: std::collections::HashMap<std::string::String, std::string::String>,
+        mut del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
+    ) -> std::result::Result<Output, std::io::Error> {
+        del_env.insert(self.key.clone());
+        self.on.run_internal(input, clear_env, env, del_env, path)
+    }
 }
 
 /// Adds a key-value to the calling environment.
@@ -184,9 +289,11 @@ impl<F: Command> Command for Env<F> {
         input: Option<&str>,
         clear_env: bool,
         mut env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
         env.insert(self.key.clone(), self.value.clone());
-        self.on.run_internal(input, clear_env, env)
+        self.on.run_internal(input, clear_env, env, del_env, path)
     }
 }
 
@@ -212,10 +319,18 @@ impl<F: Command, S: Command> Command for Pipe<F, S> {
         input: std::option::Option<&str>,
         clear_env: bool,
         env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
-        let first = self.first.run_internal(input, clear_env, env.clone())?;
+        let first = self.first.run_internal(
+            input,
+            clear_env,
+            env.clone(),
+            del_env.clone(),
+            path.clone(),
+        )?;
         self.second
-            .run_internal(Some(&first.stdout), clear_env, env)
+            .run_internal(Some(&first.stdout), clear_env, env, del_env, path)
     }
 }
 
@@ -230,9 +345,13 @@ impl<F: Command, S: Command> Command for Then<F, S> {
         input: std::option::Option<&str>,
         clear_env: bool,
         env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
-        self.first.run_internal(input, clear_env, env.clone())?;
-        self.second.run_internal(None, clear_env, env)
+        self.first
+            .run_internal(input, clear_env, env.clone(), del_env.clone(), path.clone())?;
+        self.second
+            .run_internal(None, clear_env, env, del_env, path)
     }
 }
 
@@ -258,10 +377,19 @@ impl<F: Command, S: Command> Command for And<F, S> {
         input: std::option::Option<&str>,
         clear_env: bool,
         env: std::collections::HashMap<std::string::String, std::string::String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> std::result::Result<Output, std::io::Error> {
-        let first = self.first.run_internal(input, clear_env, env.clone())?;
+        let first = self.first.run_internal(
+            input,
+            clear_env,
+            env.clone(),
+            del_env.clone(),
+            path.clone(),
+        )?;
         if first.success() {
-            self.second.run_internal(None, clear_env, env)
+            self.second
+                .run_internal(None, clear_env, env, del_env, path)
         } else {
             Ok(first)
         }
@@ -287,13 +415,22 @@ impl<F: Command, S: Command> fmt::Debug for Or<F, S> {
 impl<F: Command, S: Command> Command for Or<F, S> {
     fn run_internal(
         &self,
-        input: std::option::Option<&str>,
+        input: Option<&str>,
         clear_env: bool,
-        env: std::collections::HashMap<std::string::String, std::string::String>,
-    ) -> std::result::Result<Output, std::io::Error> {
-        let first = self.first.run_internal(input, clear_env, env.clone())?;
+        env: HashMap<String, String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
+    ) -> io::Result<Output> {
+        let first = self.first.run_internal(
+            input,
+            clear_env,
+            env.clone(),
+            del_env.clone(),
+            path.clone(),
+        )?;
         if !first.success() {
-            self.second.run_internal(None, clear_env, env)
+            self.second
+                .run_internal(None, clear_env, env, del_env, path)
         } else {
             Ok(first)
         }
@@ -331,28 +468,28 @@ impl Command for Single {
     fn run_internal(
         &self,
         input: Option<&str>,
-        clear_env: bool,
+        do_clear_env: bool,
         env: HashMap<String, String>,
+        del_env: HashSet<String>,
+        path: Option<std::path::PathBuf>,
     ) -> Result<Output, std::io::Error> {
         let f = self.0.first().unwrap();
-        let mut out = if clear_env {
-            process::Command::new(f)
-                .args(self.0.iter().skip(1))
-                .stderr(Stdio::piped())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .env_clear()
-                .envs(env.iter())
-                .spawn()?
-        } else {
-            process::Command::new(f)
-                .args(self.0.iter().skip(1))
-                .stderr(Stdio::piped())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .envs(env.iter())
-                .spawn()?
-        };
+        let mut out = envs_remove(
+            clear_env(
+                with_path(
+                    process::Command::new(f)
+                        .args(self.0.iter().skip(1))
+                        .stderr(Stdio::piped())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped()),
+                    path,
+                ),
+                do_clear_env,
+            )
+            .envs(env.iter()),
+            del_env.iter(),
+        )
+        .spawn()?;
         if let Some(input) = input {
             write!(
                 match out.stdin.as_mut() {
@@ -382,5 +519,41 @@ impl Single {
     pub fn a(mut self, argument: &str) -> Self {
         self.0.push(argument.to_owned());
         self
+    }
+
+    /// Adds multiple arguments.
+    pub fn args(self, arguments: &[&str]) -> Self {
+        arguments
+            .iter()
+            .fold(self, |this: Single, arg: &&str| this.a(arg))
+    }
+}
+
+fn envs_remove<I, K>(command: &mut process::Command, keys: I) -> &mut process::Command
+where
+    I: IntoIterator<Item = K>,
+    K: AsRef<std::ffi::OsStr>,
+{
+    let mut iter = keys.into_iter();
+    match iter.next() {
+        Some(k) => envs_remove(command.env_remove(k), iter),
+        None => command,
+    }
+}
+
+fn clear_env(command: &mut process::Command, clear: bool) -> &mut process::Command {
+    match clear {
+        true => command.env_clear(),
+        false => command,
+    }
+}
+
+fn with_path(
+    command: &mut process::Command,
+    path: Option<std::path::PathBuf>,
+) -> &mut process::Command {
+    match path {
+        Some(p) => command.current_dir(p),
+        None => command,
     }
 }
