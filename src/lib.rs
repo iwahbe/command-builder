@@ -516,16 +516,21 @@ impl Single {
     }
 
     /// Adds an argument to the command.
-    pub fn a(mut self, argument: &str) -> Self {
-        self.0.push(argument.to_owned());
+    pub fn a<S>(mut self, argument: S) -> Self
+    where
+        S: AsRef<str>,
+    {
+        self.0.push(argument.as_ref().to_owned());
         self
     }
 
     /// Adds multiple arguments.
-    pub fn args(self, arguments: &[&str]) -> Self {
-        arguments
-            .iter()
-            .fold(self, |this: Single, arg: &&str| this.a(arg))
+    pub fn args<I, S>(self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        arguments.into_iter().fold(self, |this, arg| this.a(arg))
     }
 }
 
