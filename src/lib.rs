@@ -516,7 +516,7 @@ impl Single {
     }
 
     /// Adds an argument to the command.
-    pub fn a<S>(mut self, argument: S) -> Self
+    pub fn arg<S>(mut self, argument: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -530,7 +530,7 @@ impl Single {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        arguments.into_iter().fold(self, |this, arg| this.a(arg))
+        arguments.into_iter().fold(self, |this, arg| this.arg(arg))
     }
 }
 
